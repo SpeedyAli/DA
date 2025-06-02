@@ -1,15 +1,66 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import plotly.express as px
-import plotly.graph_objects as go
-from io import BytesIO
+import plotly.graph_objs as go
+from io import BytesIO, StringIO
 
-st.set_page_config(page_title="Gas Temperature Data Analytics", layout="wide")
-
-st.title("Gas Temperature Data Analytics Platform")
+st.set_page_config(page_title="Gas Temperature Comparison & Analytics", layout="wide")
+st.title("Gas Temperature Data Analytics & Comparison Tool")
 
 uploaded_file = st.file_uploader("Upload your Excel file", type=["xlsx"])
+
+if not uploaded_file:
+ st.markdown("""  
+---
+
+### 📄 What This Tool Does  
+This tool calculates and compares **gas condensate dew point temperatures** using 4 published equations.  
+It helps identify which formula gives the most accurate results by comparing with your experimental data.
+
+---
+
+### 📥 What You Need to Upload (Excel File)
+
+Your Excel file **must have these columns**:
+
+- **Pressure**: in **kPa**  
+- **Molecular_Weight**: used to calculate Gas Gravity (γ)  
+- **Experimental_Temperature**: in **Kelvin (K)**
+
+✅ Column names should be exactly like above (case-sensitive).  
+✅ File should be in `.xlsx` format and on the **first sheet**.
+
+---
+
+### 📊 What You'll Get:
+
+- Temperatures calculated by:
+  - Safamirzaei (uses kPa)
+  - Motiee (°C → K)
+  - Towler & Mokhatab (°F → K)
+  - Khamehchi (°F → K)
+- A **graph** showing all calculated vs experimental temperatures  
+- **Error metrics** like MAPE, MIPE, and ARD  
+- Option to download:
+  - The graph (PNG, HTML)
+  - The error table (CSV)
+
+---
+
+### ⚙️ Behind The Scenes:
+
+- Converts pressure from **kPa → psi** for equations that require it  
+- Converts temperature outputs to **Kelvin** for fair comparison  
+- Automatically calculates Gas Gravity:
+  \[
+  γ_g = Molecular Weight / 28.97
+  \]
+
+---
+
+🎯 This is a **minor project tool** designed for engineers, students, or researchers working with gas condensate systems and needing temperature estimations under different models.
+
+""", unsafe_allow_html=True)
 
 if uploaded_file:
     data = pd.read_excel(uploaded_file)
@@ -17,78 +68,143 @@ if uploaded_file:
     st.subheader("Raw Data")
     edited_data = st.data_editor(data, use_container_width=True)
 
-    st.sidebar.header("Enter Constants for Safamirzaei Equation")
+    st.sidebar.header("Constants for Safamirzaei Equation")
     A = st.sidebar.number_input("A", value=194.681789)
     B = st.sidebar.number_input("B", value=0.044232)
     C = st.sidebar.number_input("C", value=0.189829)
 
     st.sidebar.header("Select Columns")
 
-    # Column defaults
-    default_pressure_col = 'Pressure' if 'Pressure' in edited_data.columns else edited_data.columns[0]
-    default_gamma_col = 'Molecular_Weight' if 'Molecular_Weight' in edited_data.columns else edited_data.columns[0]
-    default_exp_col = 'Experimental_Temperature' if 'Experimental_Temperature' in edited_data.columns else "None"
+    pressure_col = st.sidebar.selectbox("Pressure Column (in kPa)", edited_data.columns,
+        index=edited_data.columns.get_loc("Pressure") if "Pressure" in edited_data.columns else 0)
+    gamma_col = st.sidebar.selectbox("Molecular Weight Column", edited_data.columns,
+        index=edited_data.columns.get_loc("Molecular_Weight") if "Molecular_Weight" in edited_data.columns else 0)
+    experimental_col = st.sidebar.selectbox("Experimental Temperature Column (in Kelvin)", edited_data.columns,
+        index=edited_data.columns.get_loc("Experimental_Temperature") if "Experimental_Temperature" in edited_data.columns else 0)
 
-    pressure_col = st.sidebar.selectbox("Pressure Column", edited_data.columns, index=edited_data.columns.get_loc(default_pressure_col))
-    gamma_col = st.sidebar.selectbox("Gas Gravity or Molecular Weight Column", edited_data.columns, index=edited_data.columns.get_loc(default_gamma_col))
-    experimental_col = st.sidebar.selectbox("Experimental Temperature Column (Optional)", ["None"] + list(edited_data.columns), index=(["None"] + list(edited_data.columns)).index(default_exp_col))
+    # Convert MW to Gas Gravity
+    edited_data['Gamma'] = edited_data[gamma_col] / 28.97
+    gamma = edited_data['Gamma']
+    P_kPa = edited_data[pressure_col]
+    P_psi = P_kPa / 6.89476
 
-    def calculate_temperature(P, gamma):
-        return A * (gamma ** B) * (np.log(P) ** C)
+    # Safamirzaei
+    edited_data['T_Safamirzaei'] = A * (gamma ** B) * (np.log(P_kPa) ** C)
 
-    # Always convert MW to Gamma if column is MW
-    convert_to_gamma = gamma_col.lower().strip() in ["molecular_weight", "mw"]
-    if convert_to_gamma:
-        edited_data['Gamma'] = edited_data[gamma_col] / 28.97
-    else:
-        edited_data['Gamma'] = edited_data[gamma_col]
+    # Motiee (°C → K)
+    T_motiee_C = (-283.24469 + 78.99667 * np.log10(P_psi) -
+                  5.352544 * (np.log10(P_psi) ** 2) +
+                  349.473877 * gamma - 150.854675 * gamma ** 2 -
+                  27.604065 * gamma * np.log10(P_psi))
+    edited_data['T_Motiee'] = T_motiee_C + 273.15
 
-    edited_data['Calculated_Temperature'] = calculate_temperature(edited_data[pressure_col], edited_data['Gamma'])
+    # Towler & Mokhatab (°F → K)
+    T_towler_F = (13.47 * np.log(P_psi) + 34.27 * np.log(gamma) -
+                  1.675 * (np.log(P_psi) * np.log(gamma)) - 20.35)
+    edited_data['T_Towler'] = (T_towler_F - 32) * 5 / 9 + 273.15
 
-    if experimental_col != "None":
-        edited_data['Difference'] = abs(edited_data['Calculated_Temperature'] - edited_data[experimental_col])
+    # Khamehchi (°F → K, corrected form)
+    lnP = np.log(P_psi)
+    T_khamsehchi_F = (
+        -26.115
+        - 23.728 / gamma
+        + 23.942 * lnP
+        - 0.738 * np.exp(gamma ** -2.3)
+        - 1.135 * (lnP ** 2)
+        + 0.443 * lnP * np.exp(gamma ** -1.7)
+    )
+    edited_data['T_Khamehchi'] = (T_khamsehchi_F - 32) * 5 / 9 + 273.15
+
+    exp_T = edited_data[experimental_col]
+
+    def calc_errors(pred):
+        mape = np.max(np.abs((exp_T - pred) / exp_T)) * 100
+        mipe = np.min(np.abs((exp_T - pred) / exp_T)) * 100
+        ard = np.mean(np.abs((exp_T - pred) / exp_T)) * 100
+        return mape, mipe, ard
+
+    errors = {}
+    for col in ['T_Safamirzaei', 'T_Motiee', 'T_Towler', 'T_Khamehchi']:
+        errors[col] = calc_errors(edited_data[col])
+
+    st.sidebar.subheader("Error Metrics (%)")
+    error_df = pd.DataFrame(errors, index=["MAPE", "MIPE", "ARD"]).T
+    st.sidebar.dataframe(error_df.style.format("{:.2f}"))
+
+    csv = error_df.reset_index().to_csv(index=False).encode()
+    st.sidebar.download_button("Download Error Metrics CSV", csv, "error_metrics.csv", "text/csv")
 
     st.subheader("Processed Data")
     st.dataframe(edited_data, use_container_width=True)
 
-    st.subheader("Graphs")
+    st.subheader("Comparison Graph")
+    method_names = {
+        "T_Safamirzaei": "Safamirzaei",
+        "T_Motiee": "Motiee",
+        "T_Towler": "Towler & Mokhatab",
+        "T_Khamehchi": "Khamehchi"
+    }
+
+    show_methods = {}
+    for method in method_names:
+        show_methods[method] = st.checkbox(f"Show {method_names[method]}", value=True)
 
     fig = go.Figure()
+    for method, label in method_names.items():
+        if show_methods[method]:
+            fig.add_trace(go.Scatter(
+                x=edited_data[pressure_col],
+                y=edited_data[method],
+                mode='lines+markers',
+                name=label,
+                text=[f"γ: {g:.4f}" for g in edited_data['Gamma']],
+                hovertemplate="Pressure: %{x}<br>Temperature: %{y}<br>%{text}<extra></extra>"
+            ))
 
-    for gamma_value in edited_data['Gamma'].unique():
-        subset = edited_data[edited_data['Gamma'] == gamma_value]
-        fig.add_trace(go.Scatter(
-            x=subset[pressure_col],
-            y=subset['Calculated_Temperature'],
-            mode='lines+markers',
-            name=f'Gamma: {round(gamma_value, 3)}'
-        ))
+    fig.add_trace(go.Scatter(
+        x=edited_data[pressure_col],
+        y=edited_data[experimental_col],
+        mode='markers',
+        name='Experimental',
+        marker=dict(color='black', symbol='x')
+    ))
 
-    if experimental_col != "None":
-        fig.add_trace(go.Scatter(
-            x=edited_data[pressure_col],
-            y=edited_data[experimental_col],
-            mode='markers',
-            name='Experimental',
-            marker=dict(color='black', symbol='x')
-        ))
-
-    fig.update_layout(
-        xaxis_title='Pressure',
-        yaxis_title='Temperature',
-        legend_title='Legend',
-        hovermode='x unified'
-    )
-
+    fig.update_layout(xaxis_title="Pressure (kPa)", yaxis_title="Temperature (K)", height=600)
     st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Heatmap (Difference Detection)")
-    if experimental_col != "None":
-        heatmap_data = edited_data.pivot_table(index='Gamma', columns=pressure_col, values='Difference')
-        heatmap_fig = px.imshow(heatmap_data, text_auto=True, color_continuous_scale='RdBu', aspect='auto')
-        st.plotly_chart(heatmap_fig, use_container_width=True)
+    # Export HTML
+    html_buf = StringIO()
+    fig.write_html(html_buf, include_plotlyjs='cdn')
+    html_data = html_buf.getvalue()
+    st.download_button("Download Graph as HTML", data=html_data, file_name="comparison_graph.html", mime="text/html")
 
-    st.subheader("Export Graph as Image")
-    buf = BytesIO()
-    fig.write_image(buf, format="png")
-    st.download_button("Download Main Graph", data=buf.getvalue(), file_name="graph.png", mime="image/png")
+    # Export PNG
+    png_buf = BytesIO()
+    fig.write_image(png_buf, format='png')
+    st.download_button("Download Graph as PNG", data=png_buf.getvalue(), file_name="comparison_graph.png", mime="image/png")
+
+    # Equation Section
+    
+    st.subheader("Calculation Details & Units")
+    st.markdown(r"""
+    - **Pressure Input Unit**: Input is in **kPa**, internally converted to **psi** where needed.
+    - **Temperature Output Unit**: All results are shown in **Kelvin (K)**.
+    - **Gas Gravity**: Calculated from Molecular Weight as:
+    \[γ_g = Molecular Weight / 28.97\]
+
+    ---
+
+    ### Equations Used
+
+    #### 1. Safamirzaei:
+    \[T_(K) = A * γ^B * (ln P_(kPa))^C\]
+
+    #### 2. Motiee (converted from °C):
+    \[T = -283.24469 + 78.99667 log P - 5.352544 (log P)^2 + 349.473877 γ_g - 150.854675 γ_g^2 - 27.604065 γ_g log P\]
+
+    #### 3. Towler & Mokhatab (converted from °F):
+    \[T = 13.47 ln P + 34.27 ln γ_g - 1.675 (ln P)(ln γ_g) - 20.35\]
+
+    #### 4. Khamehchi (converted from °F):
+    \[T = -26.115 - 23.728/γ_g + 23.942 ln(P) - 0.738 exp(γ_g^-2.3) - 1.135(ln(P))^2 + 0.443(ln(P))exp(γ_g^-1.7)\]
+    """, unsafe_allow_html=True)

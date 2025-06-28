@@ -172,9 +172,6 @@ if uploaded_file:
     html_buf = StringIO()
     fig.write_html(html_buf, include_plotlyjs='cdn')
     st.download_button("Download Graph as HTML", data=html_buf.getvalue(), file_name="comparison_graph.html", mime="text/html")
-    png_buf = BytesIO()
-    fig.write_image(png_buf, format='png')
-    st.download_button("Download Graph as PNG", data=png_buf.getvalue(), file_name="comparison_graph.png", mime="image/png")
 
     st.subheader("Calculation Details & Units")
     st.markdown(r"""
